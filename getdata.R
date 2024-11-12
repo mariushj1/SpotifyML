@@ -1,0 +1,160 @@
+library(spotifyr)
+library(tidyverse)
+library(httr)
+library(stringr)
+Sys.getenv()
+
+
+# API Key
+access_token <- get_spotify_access_token(client_id = Sys.getenv('SPOTIFY_CLIENT_ID'),
+                                         client_secret = Sys.getenv('SPOTIFY_CLIENT_SECRET'))
+
+get_track_audio_features_over_100 <- function(ids) {
+  
+  # Remove NA values
+  ids <- ids[!is.na(ids)]
+  len <- length(ids)
+  repetitions <- floor(len / 100) * 100
+  intervals <- c(seq(from = 0, to = repetitions, by = 100), len)
+  
+  features <- data.frame()
+  
+  for(i in seq_along(intervals)){
+    start <- intervals[i]
+    end <- intervals[i + 1] - 1
+    if(is.na(end)) break
+    
+    # Get inner features
+    inner_features <- get_track_audio_features(ids = ids[start:end])
+    features <- rbind(features, inner_features)
+    
+    # Show progress
+    progress <- (i / length(intervals)) * 100
+    cat(sprintf("Progress: %.2f%% completed\n", progress))
+  }
+  
+  return(features)
+}
+
+# Get a list of genre-specific playlists
+genres <- c('pop', 'r&b', 'rap', 'rock', 'jazz', 'edm')
+
+# Defines subgenre names
+subgenres <- data.frame(genre = c(rep('pop', 6), rep('rap', 6), rep('rock', 6), rep('jazz', 6), rep('r&b', 6), rep('edm', 6)),
+                        subgenre = c('pop music','dance pop', 'post-teen pop', 'electropop', 'indie poptimism','Disco pop', 
+                                     'rap musc', 'hip hop', 'southern hip hop', 'gangster rap', 'trap','drill rap', 
+                                     'rock music','album rock', 'classic rock', 'permanent wave', 'hard rock', 'metal rock',
+                                     'jazz music','bebop', 'cool jazz', 'hard bop', 'free jazz','swing jazz', 
+                                     'r&b music','urban contemporary', 'hip pop', 'new jack swing', 'neo soul','gospel r&b',
+                                     'electronic dance music','electro house', 'big room', 'pop edm', 'progressive electro house','future bass'),
+                        stringsAsFactors = FALSE)
+
+playlist_ids <- NULL
+
+# Creating loop to find relevant playlists 
+for (i in 1:nrow(subgenres)) {
+  
+   # Search spotify for playlists
+  playlist_list <- search_spotify(q = subgenres$subgenre[i], 
+                        type = 'playlist', 
+                        limit = 30,
+                        authorization = access_token)
+  
+  # Transforms the dataframe
+  playlist_list <- playlist_list %>% 
+    select(name, id) %>%
+    mutate(subgenre = subgenres$subgenre[i],
+           genre = subgenres$genre[i])
+  
+  playlist_ids <- rbind(playlist_ids, playlist_list)
+}
+
+# Clean the playlist dataframe
+playlist_ids <- playlist_ids %>%
+  filter(!str_detect(tolower(name), "cocomelon"),
+         !str_detect(tolower(name), "your top songs"))
+
+  
+# Get the track ids
+playlist_songs <- NULL
+
+for(i in 1:nrow(playlist_ids)) {
+  
+  song_list <- get_playlist_tracks(playlist_id = playlist_ids$id[i])
+  
+  
+  if ("track.id" %in% colnames(song_list)) {
+    song_list <- song_list %>%
+      filter(!is.na(track.id)) %>%
+      # separate out the df column artists
+      unnest(cols = 'track.artists') %>%
+      group_by(track.id) %>%
+      mutate(row_number = 1:n(),
+             track.artist = name) %>%
+      ungroup() %>%
+      filter(row_number == 1) %>%
+      select(track.id, track.name, track.artist, track.popularity, track.album.id, track.album.name, track.album.release_date) %>%
+      mutate(playlist_name = playlist_ids$name[i],
+             playlist_id = playlist_ids$id[i],
+             playlist_genre = playlist_ids$genre[i],
+             playlist_subgenre = playlist_ids$subgenre[i])
+    
+    # Combine the results
+    playlist_songs <- rbind(playlist_songs, song_list)
+    
+  } else {
+    # Print message if track.id does not exist
+    cat("Playlist ID:", playlist_ids$id[i], "does not contain 'track.id'.\n")
+  }
+  
+  cat("Playlist ID: ", playlist_ids$id[i], "Playlist ", i, "of: ", nrow(playlist_ids), "\n")
+}
+
+# Creates the most popular genre for each artist
+artist_genre <- playlist_songs %>%
+  group_by(track.artist, playlist_genre) %>%
+  tally(name = "genre_count") %>%
+  group_by(track.artist) %>%
+  filter(genre_count == max(genre_count)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(track.artist, playlist_genre) %>%
+  rename(common_genre = playlist_genre)
+
+# Adds the artists most common genre to the playlist_songs dataframe
+playlist_songs <- playlist_songs %>%
+  left_join(artist_genre, by = "track.artist")
+
+# Finds the duplicates
+duplicate_tracks <- playlist_songs %>%
+  group_by(track.id) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+# Filter duplicate_tracks based on artists most common genre
+filtered_tracks <- duplicate_tracks %>%
+  filter(playlist_genre == common_genre) %>%
+  distinct(track.id, .keep_all = TRUE)
+
+
+# Removes all rows from playlist_songs that occurs multiple times
+playlist_songs <- playlist_songs %>%
+  group_by(track.id) %>%
+  filter(n() == 1) %>%
+  ungroup()
+
+# Adds back the duplicated tracks with the correct genre
+playlist_songs <- rbind(playlist_songs, filtered_tracks)
+
+
+# Get track audio features
+playlist_audio <- get_track_audio_features_over_100(ids = playlist_songs$track.id)
+
+
+# Combine
+playlist_songs <- playlist_songs %>%
+  left_join(select(playlist_audio, -track_href, -uri, -analysis_url, -type, -time_signature), by = c('track.id' = 'id')) %>%
+  unique() %>%
+  filter(!is.na(danceability))
+
+
